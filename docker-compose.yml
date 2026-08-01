@@ -1,0 +1,31 @@
+services:
+  cache:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  upstream:
+    build: .
+    command: ["uvicorn", "upstream.main:app", "--host", "0.0.0.0", "--port", "9000"]
+    ports:
+      - "9000:9000"
+
+  gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://cache:6379/0
+      UPSTREAM_URL: http://upstream:9000
+      CB_FAILURE_THRESHOLD: ${CB_FAILURE_THRESHOLD:-5}
+      CB_RECOVERY_TIMEOUT_SECONDS: ${CB_RECOVERY_TIMEOUT_SECONDS:-30}
+      CB_HALF_OPEN_MAX_CALLS: ${CB_HALF_OPEN_MAX_CALLS:-1}
+      DEFAULT_TIER: ${DEFAULT_TIER:-free}
+    depends_on:
+      cache:
+        condition: service_healthy
+      upstream:
+        condition: service_started
