@@ -3,27 +3,58 @@
 A reverse-proxy API gateway demonstrating two classic distributed-systems
 resilience patterns: a **token bucket rate limiter** with per-client tiers, and
 a **circuit breaker** protecting a downstream service from cascading failure.
-Written in Python (FastAPI), state shared in Redis so it works correctly
-across multiple gateway replicas, runnable locally with a single
-`docker compose up`.
+
+Deployed as **multiple replicas behind a load balancer** with all coordination
+state in Redis, instrumented with **Prometheus + Grafana**, and validated by a
+**tier-aware k6 load test** and a **chaos test that breaks the upstream under
+live traffic and proves the breaker shields it**.
+
+Runnable locally with a single `docker compose up`.
 
 ---
 
 ## Architecture
 
 ```
-  client ──▶ X-API-Key header ──▶ ┌─────────────────────────┐
-                                   │        Gateway           │
-                                   │  1. look up tier          │
-                                   │  2. token-bucket check ───┼──▶ Redis
-                                   │  3. circuit-breaker check ─┼──▶ Redis
-                                   │  4. proxy request ─────────┼──▶ Upstream
-                                   └─────────────────────────┘
+                        ┌──────────────┐
+   client ─────────────▶│  nginx (lb)  │ :8080
+   X-API-Key header     └──────┬───────┘
+                               │
+                ┌──────────────┴──────────────┐
+                ▼                             ▼
+        ┌───────────────┐            ┌───────────────┐
+        │  gateway-1    │            │  gateway-2    │
+        │               │            │               │
+        │ 1. look up tier            │  (identical)  │
+        │ 2. token bucket ───┐       │               │
+        │ 3. circuit check ──┼───┐   │               │
+        │ 4. proxy ──────┐   │   │   │               │
+        └────────────────┼───┼───┼───┴───────┬───────┘
+                         │   │   │           │
+                         │   ▼   ▼           │  shared state
+                         │  ┌──────────┐◀────┘  (both replicas
+                         │  │  Redis   │         see one truth)
+                         │  │ buckets  │
+                         │  │ circuit  │
+                         │  └──────────┘
+                         ▼
+                  ┌──────────────┐
+                  │   Upstream   │ :9000
+                  │  (+ failure  │
+                  │   injection) │
+                  └──────────────┘
+
+        ┌────────────┐     ┌────────────────┐
+        │ Prometheus │────▶│    Grafana     │ :3000
+        │   :9090    │     │   dashboard    │
+        └────────────┘     └────────────────┘
+           scrapes each gateway replica individually
 ```
 
-Three services via Docker Compose: the **gateway**, a **mock upstream**
-service it proxies to, and **Redis** holding both the rate-limit buckets and
-the circuit-breaker state.
+Six services via Docker Compose: **2 gateway replicas**, an **nginx load
+balancer**, a **mock upstream** with failure-injection hooks, **Redis** holding
+both the rate-limit buckets and circuit-breaker state, and a
+**Prometheus/Grafana** observability stack.
 
 ## Key design decisions
 
@@ -84,45 +115,127 @@ Demo keys (seeded on startup):
 
 ```bash
 cp .env.example .env
-docker compose up --build
+docker compose up --build --scale gateway=2
 ```
+
+| Service             | URL                        |
+| ------------------- | -------------------------- |
+| Gateway (via nginx) | http://localhost:8080      |
+| Swagger docs        | http://localhost:8080/docs |
+| Mock upstream       | http://localhost:9000      |
+| Prometheus          | http://localhost:9090      |
+| Grafana dashboard   | http://localhost:3000      |
+
+Grafana auto-provisions the datasource and the **API Gateway — Traffic, Limits
+& Resilience** dashboard; no login or setup needed.
 
 ```bash
 # A normal proxied call
-curl -H "X-API-Key: demo-free-key" http://localhost:8000/proxy/resource/42
+curl -H "X-API-Key: demo-free-key" http://localhost:8080/proxy/resource/42
 
 # Drain the free-tier bucket (11th call in a row returns 429)
 for i in $(seq 1 11); do
   curl -s -o /dev/null -w "%{http_code}\n" \
-    -H "X-API-Key: demo-free-key" http://localhost:8000/proxy/resource/1
+    -H "X-API-Key: demo-free-key" http://localhost:8080/proxy/resource/1
 done
 
 # Trip the circuit breaker: make upstream start failing, then hammer it
 curl -X POST http://localhost:9000/admin/fail
 for i in $(seq 1 6); do
   curl -s -o /dev/null -w "%{http_code}\n" \
-    -H "X-API-Key: demo-enterprise-key" http://localhost:8000/proxy/resource/1
+    -H "X-API-Key: demo-enterprise-key" http://localhost:8080/proxy/resource/1
 done
-curl http://localhost:8000/admin/circuit-status   # {"state": "open"}
+curl http://localhost:8080/admin/circuit-status   # {"state": "open"}
 
 curl -X POST http://localhost:9000/admin/recover  # restore upstream
 ```
 
+## Observability
+
+Each replica exposes `/metrics`; Prometheus discovers them through Docker DNS
+and scrapes each **individually**, which is what lets the dashboard show that
+every replica reports the *same* circuit state — visible proof that the
+breaker's state is shared through Redis rather than living in process memory.
+
+| Metric                              | Why it matters                                                          |
+| ----------------------------------- | ----------------------------------------------------------------------- |
+| `gateway_rejections_total`          | **The key gateway metric** — labeled by reason, separating "a noisy client got throttled" from "the backend is down" |
+| `gateway_circuit_state`             | Gauge (0=closed, 1=half-open, 2=open) — alertable, and graphs as a state timeline |
+| `gateway_rate_limit_allowed_total`  | Allowed traffic by tier, for quota/billing visibility                    |
+| `gateway_upstream_results_total`    | Outcomes of calls *actually forwarded* — drops to zero while the circuit is open |
+| `gateway_request_duration_seconds`  | End-to-end latency                                                       |
+| `gateway_upstream_duration_seconds` | Upstream-only latency; the gap between the two is the gateway's own overhead |
+
+As in the companion URL-shortener project, the `endpoint` label uses the route
+template (`/proxy/{path:path}`) rather than the raw path — labeling by raw path
+would mint a new time series per proxied URL, and unbounded cardinality is the
+standard way to take down a Prometheus server. A regression test asserts this.
+
+## Load testing
+
+The [k6](https://k6.io/) script runs **two client scenarios concurrently** to
+prove the limiter actually discriminates by tier:
+
+```bash
+k6 run loadtest/gateway_load.js
+```
+
+- **enterprise client** (1000/min bucket) ramps to 100 VUs → asserts a >95%
+  success rate and p95 < 100ms.
+- **free-tier client** (10/min bucket) hammers continuously → asserts that
+  **more than half its requests are rejected with 429**.
+
+That second threshold is the unusual one, and the point: most load tests only
+check that requests succeed. Here, *correct behavior includes rejecting
+traffic* — a limiter that never throttles is broken, and this test fails if
+that regresses.
+
+## Chaos test — proving the breaker actually protects the upstream
+
+Unit tests can verify the breaker's state machine. They can't verify that under
+real concurrent traffic, across replicas sharing state through Redis, the
+breaker actually stops traffic from reaching a dying backend. That's what this
+does:
+
+```bash
+./loadtest/chaos_test.sh
+```
+
+Four phases: **baseline** (healthy, circuit closed) → **break the upstream**
+(inject 503s, verify the circuit trips open) → **verify shielding** → **recover**
+(heal the upstream, wait out the timeout, verify half-open trial call closes the
+circuit).
+
+Phase 3 carries the assertion that matters. It reads the
+`gateway_upstream_results_total` counter before and after sending 20 requests
+into an open circuit, and fails unless **~zero of them reached the upstream**:
+
+```
+ Phase 3: is the upstream actually shielded?
+    sending 20 more requests while circuit is open...
+    PASS  all 20 requests short-circuited (got: 20)
+    upstream calls that leaked through: 0 (of 20)
+    PASS  upstream was shielded
+```
+
+A breaker that flips to "open" but still forwards traffic is worse than no
+breaker at all — it gives false confidence. This test is what distinguishes
+*implementing* the pattern from *proving* it works.
+
 ## Tests
 
-Runs with **no external services** — Redis is swapped for `fakeredis` and the
-upstream HTTP call is mocked with `respx`, so the suite exercises real
-gateway/limiter/breaker code paths offline.
+The unit/integration suite runs with **no external services** — Redis is
+swapped for `fakeredis` and the upstream HTTP call is mocked with `respx`.
 
 ```bash
 pip install -r requirements.txt
-pytest -q
+pytest -q          # 20 tests
 ```
 
 Covers: token bucket burst/refill/per-key isolation/tier differences, circuit
-breaker state transitions (closed → open → half-open → closed/open), and
+breaker state transitions (closed → open → half-open → closed/open),
 gateway-level behavior (missing key rejection, 429 on quota exhaustion, 503
-once the circuit trips).
+once the circuit trips), and metrics correctness including cardinality safety.
 
 ## Scaling notes
 
@@ -149,9 +262,17 @@ api-gateway/
 │   ├── circuit_breaker.py   # Redis-backed closed/open/half-open breaker
 │   ├── api_keys.py          # API key -> tier lookup
 │   ├── redis_client.py      # shared Redis client
+│   ├── metrics.py           # Prometheus instrumentation + middleware
 │   └── config.py            # env-driven settings + tier limits
 ├── upstream/
 │   └── main.py              # mock backend service (with failure-injection hooks)
+├── infra/
+│   ├── nginx.conf           # load balancer (deliberately does NOT retry 503s)
+│   ├── prometheus.yml       # per-replica scrape config via Docker DNS
+│   └── grafana/             # auto-provisioned datasource + dashboard JSON
+├── loadtest/
+│   ├── gateway_load.js      # k6: tier-aware load test w/ pass-fail thresholds
+│   └── chaos_test.sh        # breaks upstream, proves the breaker shields it
 ├── tests/                   # pytest suite (fakeredis + respx, no services needed)
 ├── Dockerfile
 ├── docker-compose.yml

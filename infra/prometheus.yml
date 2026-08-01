@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: api-gateway
+    # Resolve the "gateway" service to every replica IP so each container is
+    # scraped individually. Scraping through the load balancer would blend
+    # replicas together and hide the per-instance behavior we want to show —
+    # in particular, that all replicas observe the *same* circuit state
+    # because it lives in Redis rather than in process memory.
+    dns_sd_configs:
+      - names: ["gateway"]
+        type: A
+        port: 8000
+        refresh_interval: 5s
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

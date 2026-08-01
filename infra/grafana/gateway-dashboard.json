@@ -1,0 +1,202 @@
+{
+  "uid": "api-gateway",
+  "title": "API Gateway — Traffic, Limits & Resilience",
+  "tags": ["api-gateway"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Circuit breaker state",
+      "description": "0=closed (healthy), 1=half-open (probing), 2=open (short-circuiting). Shared across all replicas via Redis.",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "CLOSED", "color": "green", "index": 0 },
+                "1": { "text": "HALF-OPEN", "color": "orange", "index": 1 },
+                "2": { "text": "OPEN", "color": "red", "index": 2 }
+              }
+            }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "max(gateway_circuit_state{circuit=\"upstream\"})", "legendFormat": "state", "refId": "A" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Circuit state over time",
+      "description": "The chaos test is visible here: state climbs to 2 (open) when upstream fails, drops to 1 (half-open) after the recovery timeout, then back to 0 (closed) once a trial call succeeds.",
+      "gridPos": { "h": 6, "w": 18, "x": 6, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 2,
+          "custom": { "fillOpacity": 30, "lineInterpolation": "stepAfter", "lineWidth": 2 },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "closed" },
+                "1": { "text": "half-open" },
+                "2": { "text": "open" }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "max(gateway_circuit_state{circuit=\"upstream\"})", "legendFormat": "circuit", "refId": "A" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Rejections by reason (req/s)",
+      "description": "The gateway's most important panel: distinguishes 'a noisy client got throttled' (rate_limited) from 'the backend is down' (circuit_open).",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "circuit_open" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "rate_limited" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(gateway_rejections_total[1m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Allowed vs rejected traffic (req/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(gateway_rate_limit_allowed_total[1m]))",
+          "legendFormat": "allowed",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(gateway_rejections_total[1m]))",
+          "legendFormat": "rejected",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Rate limiting by tier (req/s)",
+      "description": "Free/pro/enterprise buckets in action. Free-tier clients hit their ceiling far sooner.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (tier) (rate(gateway_rate_limit_allowed_total[1m]))",
+          "legendFormat": "{{tier}} allowed",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (tier) (rate(gateway_rejections_total{reason=\"rate_limited\"}[1m]))",
+          "legendFormat": "{{tier}} throttled",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Gateway overhead vs upstream time (p95, s)",
+      "description": "The gap between the two lines is latency the gateway itself adds. It should stay small — a gateway that doubles your latency is a liability.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "fillOpacity": 0, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "p95 total",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_upstream_duration_seconds_bucket[1m])))",
+          "legendFormat": "p95 upstream",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Upstream call outcomes (req/s)",
+      "description": "Only counts calls actually forwarded. Note this drops to zero while the circuit is open — that IS the breaker protecting the upstream.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 22 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(gateway_upstream_results_total[1m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Requests by replica (req/s)",
+      "description": "Each line is one gateway container — proves the load balancer is distributing traffic and that all replicas share one Redis-backed view of limits and circuit state.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 22 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance_id) (rate(gateway_requests_total[1m]))",
+          "legendFormat": "{{instance_id}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

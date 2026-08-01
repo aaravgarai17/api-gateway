@@ -11,12 +11,13 @@ services:
     build: .
     command: ["uvicorn", "upstream.main:app", "--host", "0.0.0.0", "--port", "9000"]
     ports:
+      # Exposed so the chaos test can inject failures via /admin/fail.
       - "9000:9000"
 
+  # No published port: replicas are reached only through the load balancer,
+  # which is what allows `--scale gateway=2`.
   gateway:
     build: .
-    ports:
-      - "8000:8000"
     environment:
       REDIS_URL: redis://cache:6379/0
       UPSTREAM_URL: http://upstream:9000
@@ -29,3 +30,39 @@ services:
         condition: service_healthy
       upstream:
         condition: service_started
+    deploy:
+      replicas: 2
+
+  lb:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./infra/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - gateway
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - gateway
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./infra/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./infra/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./infra/grafana/gateway-dashboard.json:/etc/grafana/provisioning/dashboards/gateway-dashboard.json:ro
+    depends_on:
+      - prometheus
