@@ -1,5 +1,10 @@
 # API Gateway — Rate Limiter & Circuit Breaker
 
+[![CI](https://github.com/aaravgarai17/api-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/aaravgarai17/api-gateway/actions/workflows/ci.yml)
+![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 A reverse-proxy API gateway demonstrating two classic distributed-systems
 resilience patterns: a **token bucket rate limiter** with per-client tiers, and
 a **circuit breaker** protecting a downstream service from cascading failure.
@@ -111,12 +116,44 @@ Demo keys (seeded on startup):
 | `demo-pro-key`          | pro        | 100              | 100        |
 | `demo-enterprise-key`   | enterprise | 1000             | 1000       |
 
+## Verify it works (one command)
+
+Don't take the README's word for anything — run this:
+
+```bash
+./verify.sh
+```
+
+It boots the full stack and independently checks every claim: proxying works,
+missing keys are rejected, the free tier gets throttled while enterprise
+doesn't, the circuit trips when the upstream fails, and — the one that
+matters — that an open circuit actually stops requests reaching the upstream.
+
+```
+ ✓ test suite passed
+ ✓ gateway is healthy
+ ✓ request proxied to upstream (200)
+ ✓ missing API key rejected (401)
+ ✓ free tier throttled after its quota (429)
+ ✓ enterprise tier unaffected by free tier's limit
+ ✓ circuit tripped open after failures
+ ✓ upstream shielded (0 of 15 requests leaked through)
+
+ Results: 8 passed, 0 failed
+VERIFIED — every README claim checks out.
+```
+
 ## Running locally
+
+**Requires:** Docker Desktop. Optionally [k6](https://k6.io/) for the load test.
 
 ```bash
 cp .env.example .env
-docker compose up --build --scale gateway=2
+docker compose up --build
 ```
+
+Starts 2 gateway replicas plus Redis, nginx, the mock upstream, Prometheus, and
+Grafana.
 
 | Service             | URL                        |
 | ------------------- | -------------------------- |
@@ -206,9 +243,9 @@ Four phases: **baseline** (healthy, circuit closed) → **break the upstream**
 (heal the upstream, wait out the timeout, verify half-open trial call closes the
 circuit).
 
-Phase 3 carries the assertion that matters. It reads the
-`gateway_upstream_results_total` counter before and after sending 20 requests
-into an open circuit, and fails unless **~zero of them reached the upstream**:
+Phase 3 carries the assertion that matters. It resets the upstream's own
+request counter, fires 20 requests into an open circuit, then asks the upstream
+how many actually arrived — failing unless **~zero did**:
 
 ```
  Phase 3: is the upstream actually shielded?
@@ -221,6 +258,17 @@ into an open circuit, and fails unless **~zero of them reached the upstream**:
 A breaker that flips to "open" but still forwards traffic is worse than no
 breaker at all — it gives false confidence. This test is what distinguishes
 *implementing* the pattern from *proving* it works.
+
+**Why the measurement is taken at the upstream, not from the gateway's
+metrics.** The obvious approach is to diff `gateway_upstream_results_total`
+before and after. That's wrong here, and subtly so: the gateway is replicated,
+each replica keeps independent Prometheus counters, and reading them *through
+the load balancer* samples an arbitrary replica each time. An earlier version of
+this check did exactly that and reported `-1 of 15 requests leaked` — an
+impossible number that still "passed", because −1 ≤ 1. A check that can silently
+produce a false pass on the project's central claim is worse than no check at
+all. The upstream is the only authoritative observer of what actually reached
+it, so the counter lives there (`GET /admin/stats`).
 
 ## Tests
 

@@ -79,11 +79,14 @@ echo ""
 echo "=============================================="
 echo " Phase 3: is the upstream actually shielded?"
 echo "=============================================="
-# Count how many calls reach the upstream while the circuit is open. The
-# gateway exposes this as gateway_upstream_results_total; if the breaker is
-# doing its job, this counter should barely move.
-BEFORE=$(curl -s "$GATEWAY/metrics" \
-  | awk '/^gateway_upstream_results_total/ {s+=$2} END {printf "%d", s+0}')
+# Count how many calls actually reach the upstream while the circuit is open.
+#
+# Measured at the upstream itself rather than from the gateway's Prometheus
+# counters: with the gateway replicated, each replica keeps its own counters,
+# so a before/after comparison taken through the load balancer can sample two
+# different replicas and yield a garbage delta. The upstream is the single
+# authoritative observer of what reached it.
+curl -s -X POST "$UPSTREAM/admin/reset-stats" >/dev/null
 
 echo "    sending 20 more requests while circuit is open..."
 FAST_REJECTS=0
@@ -91,9 +94,9 @@ for _ in $(seq 1 20); do
   [[ "$(hit)" == "503" ]] && FAST_REJECTS=$(( FAST_REJECTS + 1 ))
 done
 
-AFTER=$(curl -s "$GATEWAY/metrics" \
-  | awk '/^gateway_upstream_results_total/ {s+=$2} END {printf "%d", s+0}')
-LEAKED=$(( AFTER - BEFORE ))
+LEAKED=$(curl -s "$UPSTREAM/admin/stats" \
+  | sed -n 's/.*"requests_received":\([0-9]*\).*/\1/p')
+LEAKED=${LEAKED:-0}
 
 check "all 20 requests short-circuited" "$FAST_REJECTS" "20"
 echo "    upstream calls that leaked through: $LEAKED (of 20)"

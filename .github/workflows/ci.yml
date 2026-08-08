@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Tests & coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # No service containers needed: fakeredis replaces Redis and respx
+      # intercepts the upstream HTTP calls.
+      - name: Run tests with coverage
+        run: pytest --cov=app --cov=upstream --cov-report=term-missing --cov-fail-under=70 -q
+
+  compose:
+    name: Validate Docker Compose
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate compose file
+        run: docker compose config --quiet
+
+      - name: Build application image
+        run: docker compose build gateway
+
+  smoke:
+    name: End-to-end smoke test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Actually boots the full stack and exercises the gateway, so the
+      # README's claims are verified on every push rather than trusted.
+      - name: Start the stack
+        run: docker compose up -d --build
+
+      - name: Wait for the gateway to become healthy
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fs http://localhost:8080/health >/dev/null 2>&1; then
+              echo "gateway is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "gateway never became healthy"; docker compose logs; exit 1
+
+      - name: Proxy a request through the gateway
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'X-API-Key: demo-enterprise-key' \
+            http://localhost:8080/proxy/resource/42)
+          echo "got $code"
+          [ "$code" = "200" ]
+
+      - name: Rate limiting rejects an over-quota client
+        run: |
+          for i in $(seq 1 15); do
+            curl -s -o /dev/null -H 'X-API-Key: demo-free-key' \
+              http://localhost:8080/proxy/resource/1
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'X-API-Key: demo-free-key' http://localhost:8080/proxy/resource/1)
+          echo "expected 429, got $code"
+          [ "$code" = "429" ]
+
+      - name: Circuit breaker trips when the upstream fails
+        run: |
+          curl -s -X POST http://localhost:9000/admin/fail >/dev/null
+          for i in $(seq 1 10); do
+            curl -s -o /dev/null -H 'X-API-Key: demo-enterprise-key' \
+              http://localhost:8080/proxy/resource/1
+            sleep 0.2
+          done
+          state=$(curl -s http://localhost:8080/admin/circuit-status)
+          echo "circuit: $state"
+          echo "$state" | grep -q '"open"'
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  lint:
+    name: Config sanity
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate Grafana dashboard and Prometheus config parse
+        run: |
+          python -c "import json; json.load(open('infra/grafana/gateway-dashboard.json')); print('dashboard ok')"
+          pip install pyyaml
+          python -c "import yaml; yaml.safe_load(open('infra/prometheus.yml')); print('prometheus ok')"
+
+      - name: Shell scripts are syntactically valid
+        run: bash -n loadtest/chaos_test.sh

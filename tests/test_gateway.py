@@ -3,13 +3,18 @@ from fastapi.testclient import TestClient
 from httpx import Response
 
 from app.api_keys import seed_demo_keys
+from app.config import settings
 from app.main import app
 
 
 @respx.mock
 def test_proxy_forwards_to_upstream(fake_redis):
     seed_demo_keys()
-    respx.get("http://localhost:9000/resource/42").mock(
+    # Build the mocked URL from the configured upstream rather than hardcoding
+    # localhost: following the README (`cp .env.example .env`) sets
+    # UPSTREAM_URL to the Docker service name, and a hardcoded mock would then
+    # never match.
+    respx.get(f"{settings.upstream_url}/resource/42").mock(
         return_value=Response(200, json={"item_id": "42", "data": "payload-for-42"})
     )
 
