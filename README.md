@@ -277,7 +277,7 @@ swapped for `fakeredis` and the upstream HTTP call is mocked with `respx`.
 
 ```bash
 pip install -r requirements.txt
-pytest -q          # 20 tests
+pytest -q          # 24 tests
 ```
 
 Covers: token bucket burst/refill/per-key isolation/tier differences, circuit
