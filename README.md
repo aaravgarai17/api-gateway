@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/aaravgarai17/api-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/aaravgarai17/api-gateway/actions/workflows/ci.yml)
 ![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)
-![Python](https://img.shields.io/badge/python-3.12-blue)
+![Python](https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 A reverse-proxy API gateway demonstrating two classic distributed-systems
@@ -117,6 +117,9 @@ Demo keys (seeded on startup):
 | `demo-enterprise-key`   | enterprise | 1000             | 1000       |
 
 ## Verify it works (one command)
+
+> **Common tasks:** `make help` lists everything — `make install`, `make test`,
+> `make verify`, and per-project shortcuts.
 
 Don't take the README's word for anything — run this:
 
